@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Infrastructure to deploy a Next.js Docker app to ECR/ECS/EC2
+
+Resources:
+  ToDoVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ToDoVPC
+
+  ToDoInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ToDoInternetGateway
+
+  ToDoInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref ToDoInternetGateway
+      VpcId: !Ref ToDoVPC
+
+  ToDoPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ToDoVPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ToDoPublicSubnet1
+
+  ToDoPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ToDoVPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ToDoPublicSubnet2
+
+  ToDoPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ToDoVPC
+      Tags:
+        - Key: Name
+          Value: ToDoPublicRouteTable
+
+  ToDoDefaultPublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ToDoPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ToDoInternetGateway
+
+  ToDoPublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ToDoPublicRouteTable
+      SubnetId: !Ref ToDoPublicSubnet1
+
+  ToDoPublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ToDoPublicRouteTable
+      SubnetId: !Ref ToDoPublicSubnet2
+
+  ToDoAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound traffic for app on port 3000
+      VpcId: !Ref ToDoVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ToDoAppSecurityGroup
+
+  ToDoECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: todo-app-docker-repo
+
+  ToDoECSInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  ToDoInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ToDoECSInstanceRole
+      Path: /
+
+  ToDoECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: todo-app-docker-cluster
+
+  ToDoLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id}}"
+        InstanceType: t2.micro
+        IamInstanceProfile:
+          Arn: !GetAtt ToDoInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref ToDoAppSecurityGroup
+        UserData: !Base64 |
+          #!/bin/bash
+          echo ECS_CLUSTER=todo-app-docker-cluster >> /etc/ecs/ecs.config
+
+  ToDoEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ToDoLaunchTemplate
+        Version: !GetAtt ToDoLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref ToDoPublicSubnet1
+
+  ToDoTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: todo-app-docker-task
+      RequiresCompatibilities:
+        - EC2
+      NetworkMode: bridge
+      Cpu: 256
+      Memory: 512
+      ContainerDefinitions:
+        - Name: todo-app-docker-container
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/todo-app-docker-repo:latest"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 3000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/todo-app-docker-task
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ToDoECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ToDoEC2Instance
+    Properties:
+      ServiceName: todo-app-docker-service
+      Cluster: !Ref ToDoECSCluster
+      DesiredCount: 0
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      LaunchType: EC2
+      TaskDefinition: !Ref ToDoTaskDefinition
+
+Outputs:
+  EcrRepositoryUri:
+    Description: ECR repository URI
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/todo-app-docker-repo"
+
+  EcsClusterName:
+    Description: ECS cluster name
+    Value: !Ref ToDoECSCluster
+
+  EcsServiceName:
+    Description: ECS service name
+    Value: !Ref ToDoECSService
+
+  TaskDefinitionFamily:
+    Description: ECS task definition family
+    Value: !Ref ToDoTaskDefinition
+
+  ContainerName:
+    Description: Container name in task definition
+    Value: "todo-app-docker-container"
+
+  AwsAccountId:
+    Description: AWS Account ID
+    Value: !Sub "${AWS::AccountId}"
+
+  AwsRegion:
+    Description: AWS Region
+    Value: !Sub "${AWS::Region}"
